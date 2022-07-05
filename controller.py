@@ -64,7 +64,10 @@ class Controller(RyuApp):
         src = eth_header.src
         dst = eth_header.dst
         self.logger.debug("Packet from {} on port {} to {}".format(src, in_port, dst))
+
+        # "Learn" port for src MAC address
         self.mac_port_mapping[src] = in_port
+        self.logger.info("Learned: {} is at port {}".format(src, in_port))
 
         actions = []
         if dst in self.mac_port_mapping:
@@ -72,6 +75,18 @@ class Controller(RyuApp):
             out_port = self.mac_port_mapping[dst]
             self.logger.debug("{} is at port {} -> port out".format(dst, out_port))
             actions.append(datapath.ofproto_parser.OFPActionOutput(out_port))
+
+            # Make switch process packets to src on its own in the future
+            # We can't add the flow entry above when learning the src MAC address.
+            # If we would add the entry there, we wouldn't be able to learn where to send the
+            # request to, as the response would be handled by the switch on its own.
+            self.__add_flow(
+                datapath,
+                10,
+                parser.OFPMatch(eth_dst=dst),
+                [datapath.ofproto_parser.OFPActionOutput(out_port)],
+                timeout=10,
+            )
         else:
             # Outport is unknown -> flood
             self.logger.debug("{} is at unknown port -> flood".format(dst))
@@ -81,7 +96,7 @@ class Controller(RyuApp):
         self.logger.info("Sending packet out")
         datapath.send_msg(out)
 
-    def __add_flow(self, datapath, priority, match, actions):
+    def __add_flow(self, datapath, priority, match, actions, timeout=0):
         '''
         Install Flow Table Modification
 
@@ -92,6 +107,6 @@ class Controller(RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst)
+        mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst, idle_timeout=timeout)
         self.logger.info("Flow-Mod written to {}".format(dpid_to_str(datapath.id)))
         datapath.send_msg(mod)
