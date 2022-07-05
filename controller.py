@@ -24,6 +24,7 @@ class Controller(RyuApp):
     def __init__(self, *args, **kwargs):
         super(Controller, self).__init__(*args, **kwargs)
 
+        # Stores the mapping from destination mac to outgoing switch port
         self.mac_port_mapping = dict()
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -37,10 +38,20 @@ class Controller(RyuApp):
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+
         self.logger.info("Handshake taken place with {}".format(dpid_to_str(datapath.id)))
-        self.__add_flow(datapath, 0, match, actions)
+
+        # Initialize mapping for datapath
+        self.mac_port_mapping[dpid_to_str(datapath.id)] = {}
+
+        self.__add_flow(
+            datapath,
+            0,
+            # Match all packets
+            parser.OFPMatch(),
+            # Send packet to controller
+            [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)],
+        )
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -53,27 +64,26 @@ class Controller(RyuApp):
         '''
         msg = ev.msg
         datapath = msg.datapath
-        ofproto = msg.datapath.ofproto
-        parser = msg.datapath.ofproto_parser
-        dpid = msg.datapath.id
-        pkt = packet.Packet(msg.data)
+        dpid = dpid_to_str(datapath.id)
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
         in_port = msg.match['in_port']
         data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
 
         eth_header = packet.Packet(data).get_protocol(ethernet.ethernet)
         src = eth_header.src
         dst = eth_header.dst
-        self.logger.debug("Packet from {} on port {} to {}".format(src, in_port, dst))
+        self.logger.debug("{}: Packet from {} on port {} to {}".format(dpid, src, in_port, dst))
 
         # "Learn" port for src MAC address
-        self.mac_port_mapping[src] = in_port
-        self.logger.info("Learned: {} is at port {}".format(src, in_port))
+        self.mac_port_mapping[dpid][src] = in_port
+        self.logger.info("{}: {} is at port {}".format(dpid, src, in_port))
 
         actions = []
-        if dst in self.mac_port_mapping:
+        if dst in self.mac_port_mapping[dpid]:
             # Outport is known -> send to outport
-            out_port = self.mac_port_mapping[dst]
-            self.logger.debug("{} is at port {} -> port out".format(dst, out_port))
+            out_port = self.mac_port_mapping[dpid][dst]
+            self.logger.debug("{}: {} is at port {} -> port out".format(dpid, dst, out_port))
             actions.append(datapath.ofproto_parser.OFPActionOutput(out_port))
 
             # Make switch process packets to src on its own in the future
@@ -89,7 +99,7 @@ class Controller(RyuApp):
             )
         else:
             # Outport is unknown -> flood
-            self.logger.debug("{} is at unknown port -> flood".format(dst))
+            self.logger.debug("{}: {} is at unknown port -> flood".format(dpid, dst))
             actions.append(datapath.ofproto_parser.OFPActionOutput(ofproto.OFPP_FLOOD))
 
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=data)
