@@ -13,7 +13,7 @@ from ryu.base.app_manager import RyuApp
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet
+from ryu.lib.packet import packet, ethernet
 from ryu.lib.dpid import dpid_to_str
 
 
@@ -23,6 +23,8 @@ class Controller(RyuApp):
 
     def __init__(self, *args, **kwargs):
         super(Controller, self).__init__(*args, **kwargs)
+
+        self.mac_port_mapping = dict()
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def features_handler(self, ev):
@@ -57,11 +59,27 @@ class Controller(RyuApp):
         pkt = packet.Packet(msg.data)
         in_port = msg.match['in_port']
         data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-        actions = [datapath.ofproto_parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+
+        eth_header = packet.Packet(data).get_protocol(ethernet.ethernet)
+        src = eth_header.src
+        dst = eth_header.dst
+        self.logger.debug("Packet from {} on port {} to {}".format(src, in_port, dst))
+        self.mac_port_mapping[src] = in_port
+
+        actions = []
+        if dst in self.mac_port_mapping:
+            # Outport is known -> send to outport
+            out_port = self.mac_port_mapping[dst]
+            self.logger.debug("{} is at port {} -> port out".format(dst, out_port))
+            actions.append(datapath.ofproto_parser.OFPActionOutput(out_port))
+        else:
+            # Outport is unknown -> flood
+            self.logger.debug("{} is at unknown port -> flood".format(dst))
+            actions.append(datapath.ofproto_parser.OFPActionOutput(ofproto.OFPP_FLOOD))
+
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=data)
         self.logger.info("Sending packet out")
         datapath.send_msg(out)
-        return
 
     def __add_flow(self, datapath, priority, match, actions):
         '''
