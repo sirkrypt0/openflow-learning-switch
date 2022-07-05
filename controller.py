@@ -59,8 +59,10 @@ class Controller(RyuApp):
         Packet In Event Handler
 
         Takes packets provided by the OpenFlow packet in event structure and
-        floods them to all ports. This is the core functionality of the Ethernet
-        Hub.
+        learns from the packet information where following packets belong to.
+        If the destination for a packet is known to the controller, it installs
+        a corresponding flow table rule to let the switches handle similar packets
+        on their own in the future.
         '''
         msg = ev.msg
         datapath = msg.datapath
@@ -69,38 +71,39 @@ class Controller(RyuApp):
         parser = datapath.ofproto_parser
         in_port = msg.match['in_port']
         data = msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
+        pkt = packet.Packet(data)
 
-        eth_header = packet.Packet(data).get_protocol(ethernet.ethernet)
-        src = eth_header.src
-        dst = eth_header.dst
-        self.logger.debug("{}: Packet from {} on port {} to {}".format(dpid, src, in_port, dst))
+        actions = [datapath.ofproto_parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        # Only learn MAC address, if packet has an ethernet header
+        if eth_header := pkt.get_protocol(ethernet.ethernet):
+            src = eth_header.src
+            dst = eth_header.dst
+            self.logger.debug("{}: Packet from {} on port {} to {}".format(dpid, src, in_port, dst))
 
-        # "Learn" port for src MAC address
-        self.mac_port_mapping[dpid][src] = in_port
-        self.logger.info("{}: {} is at port {}".format(dpid, src, in_port))
+            # "Learn" port for src MAC address
+            self.mac_port_mapping[dpid][src] = in_port
+            self.logger.info("{}: {} is at port {}".format(dpid, src, in_port))
 
-        actions = []
-        if dst in self.mac_port_mapping[dpid]:
-            # Outport is known -> send to outport
-            out_port = self.mac_port_mapping[dpid][dst]
-            self.logger.debug("{}: {} is at port {} -> port out".format(dpid, dst, out_port))
-            actions.append(datapath.ofproto_parser.OFPActionOutput(out_port))
+            if dst in self.mac_port_mapping[dpid]:
+                # Outport is known -> send to outport
+                out_port = self.mac_port_mapping[dpid][dst]
+                actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
+                self.logger.debug("{}: {} is at port {} -> port out".format(dpid, dst, out_port))
 
-            # Make switch process packets to src on its own in the future
-            # We can't add the flow entry above when learning the src MAC address.
-            # If we would add the entry there, we wouldn't be able to learn where to send the
-            # request to, as the response would be handled by the switch on its own.
-            self.__add_flow(
-                datapath,
-                10,
-                parser.OFPMatch(eth_dst=dst),
-                [datapath.ofproto_parser.OFPActionOutput(out_port)],
-                timeout=10,
-            )
-        else:
-            # Outport is unknown -> flood
-            self.logger.debug("{}: {} is at unknown port -> flood".format(dpid, dst))
-            actions.append(datapath.ofproto_parser.OFPActionOutput(ofproto.OFPP_FLOOD))
+                # Make switch process packets to src on its own in the future
+                # We can't add the flow entry above when learning the src MAC address.
+                # If we would add the entry there, we wouldn't be able to learn where to send the
+                # request to, as the response would be handled by the switch on its own.
+                self.__add_flow(
+                    datapath,
+                    10,
+                    parser.OFPMatch(eth_dst=dst),
+                    [datapath.ofproto_parser.OFPActionOutput(out_port)],
+                    timeout=10,
+                )
+            else:
+                # Outport is unknown -> flood
+                self.logger.debug("{}: {} is at unknown port -> flood".format(dpid, dst))
 
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=data)
         self.logger.info("Sending packet out")
