@@ -19,7 +19,7 @@ It provides the following features:
 We provide some topologies in the [`topology.py`](./topology.py) file that can be used with [mininet](https://github.com/mininet/mininet).
 
 ```bash
-sudo mn --switch ovsk --controller remote --custom ./topology.py --topo ringTopology
+sudo mn --switch ovsk --controller remote --custom ./topology.py --topo ring
 ```
 
 ### Virtual Machine
