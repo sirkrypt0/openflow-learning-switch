@@ -27,6 +27,19 @@ sudo mn --switch ovsk --controller remote --custom ./topology.py --topo ring
 I found the [SCC365 virtual machine](https://github.com/scc365/virtual-machine) that can be started via `vagrant` to be very useful, as it contains all the tools required.
 However, you can surely use the official [mininet VM](http://mininet.org/vm-setup-notes/).
 
+## Notes
+
+Due to the STP protocol being used, it takes some time until the network is fully response, so make sure to wait a little.
+
+### ARP responder
+
+Currently, the ARP responding logic will generate the answers to ARP requests based on the controllers cache.
+This sacrifices some speed, as ARP requests must be send to the controller, which generates a response and sends it back to the datapath.
+Ideally, we would install a flow in the datapath that generates the correct reply for us.
+However, we'd like to use the OpenFlow copy action for these flows, which are available only from OpenFlow version 1.5 on.
+Sadly, this collides with the Ryu STP implementation, which only supports OpenFlow up to version 1.3.
+Nevertheless, a possible implementation using flows in OpenFlow 1.5 can be found in the `__learn_arp_1_5` function in the `controller.py`.
+
 ## Resources
 
 - [SCC365 Ryu Tutorial](https://github.com/scc365/tutorial-ryu)
