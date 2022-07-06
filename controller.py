@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Ryu Tutorial Controller
+Ryu Learning Controller
 
-This controller allows OpenFlow datapaths to act as Ethernet Hubs. Using the
-tutorial you should convert this to a layer 2 learning switch.
-
-See the README for more...
+This controller allows OpenFlow datapaths to act as learning Ethernet switches.
 """
 
 from ryu.base.app_manager import RyuApp
@@ -60,9 +57,6 @@ class Controller(RyuApp):
 
         Takes packets provided by the OpenFlow packet in event structure and
         learns from the packet information where following packets belong to.
-        If the destination for a packet is known to the controller, it installs
-        a corresponding flow table rule to let the switches handle similar packets
-        on their own in the future.
         '''
         msg = ev.msg
         datapath = msg.datapath
@@ -141,6 +135,12 @@ class Controller(RyuApp):
             datapath.send_msg(mod)
 
     def __learn_mac_port(self, eth_header: ethernet.ethernet, src_port: int, datapath: Datapath):
+        '''Learn MAC/Port mappings based on Ethernet packets.
+
+        The mapping is stored in the controller itself. If the destination for a packet is
+        known to the controller, it installs a corresponding flow table rule to let the switches
+        handle similar packets on their own in the future.
+        '''
         src_mac = eth_header.src
         dst_mac = eth_header.dst
         dpid = datapath.id
@@ -175,6 +175,11 @@ class Controller(RyuApp):
             return datapath.ofproto.OFPP_FLOOD
 
     def __learn_arp(self, eth_header: ethernet.ethernet, arp_header: arp.arp, datapath: Datapath):
+        '''Learn MAC/IP mappings based on ARP packets and answer replies if MAC/IP is known.
+
+        Learns the MAC/IP mappings based on ARP packets. The mapping is stored in the controller and
+        replies are generated which are sent back to the switch.
+        '''
         self.logger.info("Got ARP packet: {}".format(arp_header))
 
         self.arp_table[arp_header.src_ip] = arp_header.src_mac
