@@ -11,10 +11,11 @@ See the README for more...
 
 from ryu.base.app_manager import RyuApp
 from ryu.controller import ofp_event
+from ryu.controller.controller import Datapath
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import stplib
-from ryu.lib.packet import packet, ethernet
+from ryu.lib.packet import packet, ethernet, arp
 
 
 class Controller(RyuApp):
@@ -28,6 +29,7 @@ class Controller(RyuApp):
 
         # Stores the mapping from destination mac to outgoing switch port
         self.mac_port_mapping = dict()
+        self.arp_table = dict()
         self.stplib = kwargs['stplib']
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -64,7 +66,6 @@ class Controller(RyuApp):
         '''
         msg = ev.msg
         datapath = msg.datapath
-        dpid = datapath.id
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         in_port = msg.match['in_port']
@@ -74,35 +75,15 @@ class Controller(RyuApp):
         actions = [datapath.ofproto_parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         # Only learn MAC address, if packet has an ethernet header
         if eth_header := pkt.get_protocol(ethernet.ethernet):
-            src = eth_header.src
-            dst = eth_header.dst
-            self.logger.debug("{}: Packet from {} on port {} to {}".format(dpid, src, in_port, dst))
+            out_port = self.__learn_mac_port(eth_header, in_port, datapath)
+            actions = [parser.OFPActionOutput(out_port)]
 
-            # "Learn" port for src MAC address
-            self.mac_port_mapping.setdefault(dpid, {})
-            self.mac_port_mapping[dpid][src] = in_port
-            self.logger.info("{}: {} is at port {}".format(dpid, src, in_port))
-
-            if dst in self.mac_port_mapping[dpid]:
-                # Outport is known -> send to outport
-                out_port = self.mac_port_mapping[dpid][dst]
-                actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
-                self.logger.debug("{}: {} is at port {} -> port out".format(dpid, dst, out_port))
-
-                # Make switch process packets to src on its own in the future
-                # We can't add the flow entry above when learning the src MAC address.
-                # If we would add the entry there, we wouldn't be able to learn where to send the
-                # request to, as the response would be handled by the switch on its own.
-                self.__add_flow(
-                    datapath,
-                    10,
-                    parser.OFPMatch(eth_dst=dst),
-                    [datapath.ofproto_parser.OFPActionOutput(out_port)],
-                    timeout=10,
-                )
-            else:
-                # Outport is unknown -> flood
-                self.logger.debug("{}: {} is at unknown port -> flood".format(dpid, dst))
+            if arp_header := pkt.get_protocol(arp.arp):
+                arp_data = self.__learn_arp(eth_header, arp_header, datapath)
+                if arp_data is not None:
+                    actions = [parser.OFPActionOutput(in_port)]
+                    in_port = ofproto.OFPP_CONTROLLER
+                    data = arp_data
 
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=data)
         self.logger.info("Sending packet out")
@@ -158,3 +139,108 @@ class Controller(RyuApp):
                 match=match,
             )
             datapath.send_msg(mod)
+
+    def __learn_mac_port(self, eth_header: ethernet.ethernet, src_port: int, datapath: Datapath):
+        src_mac = eth_header.src
+        dst_mac = eth_header.dst
+        dpid = datapath.id
+        self.logger.debug("{}: Packet from {} on port {} to {}".format(dpid, src_mac, src_port, dst_mac))
+
+        # "Learn" port for src MAC address
+        self.mac_port_mapping.setdefault(dpid, {})
+        self.mac_port_mapping[dpid][src_mac] = src_port
+        self.logger.info("{}: {} is at port {}".format(dpid, src_mac, src_port))
+
+        if dst_mac in self.mac_port_mapping[dpid]:
+            # Outport is known -> send to outport
+            out_port = self.mac_port_mapping[dpid][dst_mac]
+            actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
+            self.logger.debug("{}: {} is at port {} -> port out".format(dpid, dst_mac, out_port))
+
+            # Make switch process packets to src on its own in the future
+            # We can't add the flow entry above when learning the src MAC address.
+            # If we would add the entry there, we wouldn't be able to learn where to send the
+            # request to, as the response would be handled by the switch on its own.
+            self.__add_flow(
+                datapath,
+                10,
+                datapath.ofproto_parser.OFPMatch(eth_dst=dst_mac),
+                actions,
+                timeout=10,
+            )
+            return out_port
+        else:
+            # Outport is unknown -> flood
+            self.logger.debug("{}: {} is at unknown port -> flood".format(dpid, dst_mac))
+            return datapath.ofproto.OFPP_FLOOD
+
+    def __learn_arp(self, eth_header: ethernet.ethernet, arp_header: arp.arp, datapath: Datapath):
+        self.logger.info("Got ARP packet: {}".format(arp_header))
+
+        self.arp_table[arp_header.src_ip] = arp_header.src_mac
+
+        # If it's not a request (e.g. a gratitious ARP), nothing more to do
+        if arp_header.opcode != arp.ARP_REQUEST:
+            self.logger.info("ARP is not request, ignoring ...")
+            return None
+
+        dst_ip = arp_header.dst_ip
+
+        # If we haven't seen the destination yet, nothing more to do
+        if dst_ip not in self.arp_table:
+            self.logger.info("Destination is not known, ignoring ...")
+            return None
+
+        # Fetch stored destination MAC
+        dst_mac = self.arp_table[dst_ip]
+
+        # Build ARP reply packet
+        pkt = packet.Packet()
+        pkt.add_protocol(
+            ethernet.ethernet(
+                ethertype=eth_header.ethertype,
+                dst=eth_header.src,
+                src=dst_mac,
+        ))
+        pkt.add_protocol(
+            arp.arp(
+                opcode=arp.ARP_REPLY,
+                src_mac=dst_mac,
+                src_ip=arp_header.dst_ip,
+                dst_mac=arp_header.src_mac,
+                dst_ip=arp_header.src_ip
+        ))
+        pkt.serialize()
+        self.logger.info("Using cached ARP response: {}".format(pkt))
+        return pkt.data
+
+    def __learn_arp_1_5(self, header: arp.arp, datapath: Datapath):
+        '''Learn MAC/IP mappings based on ARP packets and install responder flow.
+
+        Learns the MAC/IP mappings based on ARP packets. The learning is done by
+        installing a flow to the datapath that transforms the incoming packet
+        such that it represents the ARP response.
+
+        Since this uses the OFPActionCopyField, this method only works from OpenFlow
+        version 1.5.
+        '''
+        self.logger.info("Got ARP packet: {}".format(header))
+        parser = datapath.ofproto_parser
+        match = parser.OFPMatch(arp_tpa=header.src_ip)
+        actions = [
+            datapath.ofproto_parser.OFPActionSetField(
+                arp_op=arp.ARP_REPLY,
+                arp_spa=header.src_ip,
+                arp_sha=header.src_mac,
+            ),
+            datapath.ofproto_parser.OFPActionCopyField(
+                oxm_ids=["eth_src", "eth_dst"],
+            ),
+        ]
+        self.__add_flow(
+            datapath,
+            20,
+            match,
+            actions,
+            60
+        )
